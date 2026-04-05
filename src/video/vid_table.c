@@ -418,8 +418,13 @@ void
 video_voodoo_init(void)
 {
     /* Enable the Voodoo if configured. */
-    if (voodoo_enabled)
+    if (voodoo_enabled) {
+#ifdef SST1_FPGA_BRIDGE
+        device_add(&voodoo_fpga_bridge_device);
+#else
         device_add(&voodoo_device);
+#endif
+    }
 }
 
 int

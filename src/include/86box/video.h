@@ -628,6 +628,9 @@ extern const device_t ps1vga_mca_device;
 
 /* 3DFX Voodoo Graphics */
 extern const device_t voodoo_device;
+#ifdef SST1_FPGA_BRIDGE
+extern const device_t voodoo_fpga_bridge_device;
+#endif
 extern const device_t voodoo_banshee_device;
 extern const device_t creative_voodoo_banshee_device;
 extern const device_t quantum3d_raven_device;

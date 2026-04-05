@@ -177,3 +177,15 @@ add_library(voodoo OBJECT
 if(NOT MSVC AND (ARCH STREQUAL "i386" OR ARCH STREQUAL "x86_64"))
     target_compile_options(voodoo PRIVATE "-msse2")
 endif()
+
+# 3Dfx Voodoo FPGA Bridge (co-simulation with Verilator model)
+option(SST1_FPGA_BRIDGE "Build the SST-1 FPGA bridge device for Verilator co-simulation" OFF)
+if(SST1_FPGA_BRIDGE)
+    target_sources(voodoo PRIVATE vid_voodoo_fpga_bridge.c)
+    target_compile_definitions(voodoo PRIVATE SST1_FPGA_BRIDGE=1)
+    # vid_table.c needs the define to switch device_add() to the FPGA bridge
+    target_compile_definitions(vid PRIVATE SST1_FPGA_BRIDGE=1)
+    if(UNIX)
+        target_link_libraries(voodoo PRIVATE rt)
+    endif()
+endif()
