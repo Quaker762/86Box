@@ -35,11 +35,13 @@
  *   svga_set_override().  When clear, the VGA card drives the monitor.
  */
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#define HAVE_STDARG_H
 
 #ifdef __linux__
 #    include <fcntl.h>
@@ -59,6 +61,29 @@
 
 /* The shared memory protocol header (C-compatible) */
 #include <86box/sst1_bridge_protocol.h>
+
+/* ========================================================================= */
+/* Debug logging                                                              */
+/* ========================================================================= */
+
+#define ENABLE_FPGA_BRIDGE_LOG 1
+
+#ifdef ENABLE_FPGA_BRIDGE_LOG
+int fpga_bridge_do_log = ENABLE_FPGA_BRIDGE_LOG;
+
+static void
+fpga_bridge_log(const char *fmt, ...)
+{
+    va_list ap;
+    if (fpga_bridge_do_log) {
+        va_start(ap, fmt);
+        pclog_ex(fmt, ap);
+        va_end(ap);
+    }
+}
+#else
+#    define fpga_bridge_log(fmt, ...)
+#endif
 
 /* ========================================================================= */
 /* SST-1 register offsets (within the 16 MB window)                          */
@@ -83,6 +108,11 @@ typedef struct voodoo_fpga_bridge_t {
     /* PCI config shadow registers (managed by RTL via bridge) */
     uint32_t mem_base_addr;   /* BAR0 value */
     int      pci_enable;      /* Command register bit 1 (memory space) */
+
+    /* Full 256-byte PCI configuration space shadow.
+     * Used as fallback when Verilator is not connected so that the
+     * guest OS can properly enumerate and size BARs. */
+    uint8_t  pci_regs[256];
 
     /* Shared memory IPC */
     int                      shm_fd;
@@ -109,8 +139,8 @@ typedef struct voodoo_fpga_bridge_t {
 
 } voodoo_fpga_bridge_t;
 
-/* Shared memory segment name (must match sst1_bridge.cpp) */
-#define SST1_SHM_NAME  "/sst1_bridge"
+/* Shared memory segment name (must match sst1_bridge_protocol.h) */
+#define SST1_SHM_NAME  "/sst1_fpga_bridge"
 
 /* SST-1 memory window size: 16 MB */
 #define SST1_MEM_SIZE  0x01000000
@@ -140,12 +170,12 @@ bridge_shm_open(voodoo_fpga_bridge_t *dev)
         /* If it doesn't exist, create it (the Verilator side may connect later) */
         dev->shm_fd = shm_open(SST1_SHM_NAME, O_CREAT | O_RDWR, 0600);
         if (dev->shm_fd < 0) {
-            fprintf(stderr, "[voodoo_fpga] shm_open(%s) failed: %s\n",
+            fpga_bridge_log("[SST-1 Verilog] shm_open(%s) failed: %s\n",
                     SST1_SHM_NAME, strerror(errno));
             return -1;
         }
         if (ftruncate(dev->shm_fd, sizeof(sst1_bridge_channel_t)) < 0) {
-            fprintf(stderr, "[voodoo_fpga] ftruncate failed: %s\n",
+            fpga_bridge_log("[SST-1 Verilog] ftruncate failed: %s\n",
                     strerror(errno));
             close(dev->shm_fd);
             dev->shm_fd = -1;
@@ -159,7 +189,7 @@ bridge_shm_open(voodoo_fpga_bridge_t *dev)
         dev->shm_fd, 0);
 
     if (dev->channel == MAP_FAILED) {
-        fprintf(stderr, "[voodoo_fpga] mmap failed: %s\n", strerror(errno));
+        fpga_bridge_log("[SST-1 Verilog] mmap failed: %s\n", strerror(errno));
         close(dev->shm_fd);
         dev->shm_fd = -1;
         dev->channel = NULL;
@@ -175,13 +205,13 @@ bridge_shm_open(voodoo_fpga_bridge_t *dev)
     /* Mark emulator side as connected */
     SST1_ATOMIC_STORE(&dev->channel->emu_connected, 1);
 
-    fprintf(stderr, "[voodoo_fpga] Shared memory connected: %s (%zu bytes)\n",
+    fpga_bridge_log("[SST-1 Verilog] Shared memory connected: %s (%zu bytes)\n",
             SST1_SHM_NAME, sizeof(sst1_bridge_channel_t));
 
     return 0;
 #else
     (void) dev;
-    fprintf(stderr, "[voodoo_fpga] Shared memory bridge requires Linux\n");
+    fpga_bridge_log("[SST-1 Verilog] Shared memory bridge requires Linux\n");
     return -1;
 #endif
 }
@@ -224,6 +254,11 @@ bridge_pci_request(voodoo_fpga_bridge_t *dev,
     if (!ch)
         return -1;
 
+    /* Fast path: if the Verilator testbench isn't connected, don't waste
+       time spinning for 1M iterations — go straight to fallback. */
+    if (!SST1_ATOMIC_LOAD(&ch->tb_connected))
+        return -1;
+
     /* Set up the request */
     SST1_ATOMIC_STORE(&ch->pci_cfg_addr, cfg_addr);
     SST1_ATOMIC_STORE(&ch->pci_addr, mem_addr);
@@ -245,8 +280,8 @@ bridge_pci_request(voodoo_fpga_bridge_t *dev,
         }
     }
 
-    fprintf(stderr, "[voodoo_fpga] PCI request timeout (req=%u, cfg_addr=0x%x)\n",
-            req_type, cfg_addr);
+    fpga_bridge_log("[SST-1 Verilog] PCI request timeout (req=%u, cfg_addr=0x%x)\n",
+                    req_type, cfg_addr);
     return -1;
 }
 
@@ -268,31 +303,17 @@ fpga_pci_read(int func, int addr, UNUSED(int len), void *priv)
                            (uint32_t)(addr & ~3), 0, 0, &rdata) == 0) {
         /* Extract the requested byte from the 32-bit DWORD */
         int shift = (addr & 3) * 8;
-        return (uint8_t)(rdata >> shift);
+        uint8_t result = (uint8_t)(rdata >> shift);
+        fpga_bridge_log("[SST-1 Verilog] PCI CFG READ  addr=0x%02X -> 0x%02X (from RTL)\n", addr, result);
+        return result;
     }
 
     /*
-     * Fallback: return hardcoded Voodoo 1 identity so 86Box's PCI scan
-     * at least finds the device even if the Verilator process isn't running.
+     * Fallback: return the shadow PCI config register.
+     * This is a full 256-byte space initialised with Voodoo 1 identity
+     * and updated by fpga_pci_write(), so BAR sizing etc. works correctly.
      */
-    switch (addr) {
-        case 0x00: return 0x1a;  /* Vendor ID low (3Dfx = 0x121A) */
-        case 0x01: return 0x12;  /* Vendor ID high */
-        case 0x02: return 0x01;  /* Device ID low (SST-1) */
-        case 0x03: return 0x00;  /* Device ID high */
-        case 0x04: return dev->pci_enable ? 0x02 : 0x00;
-        case 0x08: return 0x02;  /* Revision ID */
-        case 0x0a: return 0x00;  /* Sub-class */
-        case 0x0b: return 0x00;  /* Base class (pre-VGA) */
-        case 0x0e: return 0x00;  /* Header type */
-        case 0x10: return 0x00;  /* BAR0 [7:0] */
-        case 0x11: return 0x00;  /* BAR0 [15:8] */
-        case 0x12: return 0x00;  /* BAR0 [23:16] */
-        case 0x13: return (uint8_t)(dev->mem_base_addr >> 24);
-        case 0x3c: return 0x05;  /* Int Line (IRQ5) */
-        case 0x3d: return 0x01;  /* Int Pin (INTA#) */
-        default:   return 0x00;
-    }
+    return dev->pci_regs[addr & 0xFF];
 }
 
 static void
@@ -303,27 +324,70 @@ fpga_pci_write(int func, int addr, UNUSED(int len), uint8_t val, void *priv)
     if (func)
         return;
 
+    fpga_bridge_log("[SST-1 Verilog] PCI CFG WRITE addr=0x%02X val=0x%02X\n", addr, val);
+
     /* Forward to RTL model */
     bridge_pci_request(dev, SST1_PCI_REQ_CONFIG_WRITE,
                        (uint32_t)(addr & ~3), 0, (uint32_t)val << ((addr & 3) * 8),
                        NULL);
 
     /*
-     * Also maintain local shadow state so 86Box's memory mapping works
-     * even during Verilator communication.
+     * Update the shadow PCI config space.  Some registers have special
+     * behaviour (read-only fields, BAR sizing masks, etc.).
      */
     switch (addr) {
-        case 0x04:
+        case 0x00: case 0x01:   /* Vendor ID — read-only */
+        case 0x02: case 0x03:   /* Device ID — read-only */
+        case 0x08:              /* Revision — read-only */
+        case 0x0a: case 0x0b:   /* Class code — read-only */
+        case 0x0e:              /* Header type — read-only */
+        case 0x2c: case 0x2d:   /* Subsystem Vendor — read-only */
+        case 0x2e: case 0x2f:   /* Subsystem ID — read-only */
+        case 0x3d:              /* Int Pin — read-only */
+            break;
+
+        case 0x04:  /* Command register */
+            dev->pci_regs[0x04] = val;
             dev->pci_enable = val & 0x02;
             fpga_recalc_mapping(dev);
             break;
+        case 0x05:  /* Command register high byte */
+            dev->pci_regs[0x05] = val;
+            break;
+        case 0x06: case 0x07:  /* Status register — write-1-to-clear */
+            dev->pci_regs[addr] &= ~val;
+            break;
 
-        case 0x13:
+        case 0x10:  /* BAR0 byte 0 — low 24 bits are hardwired to 0 (16MB) */
+            dev->pci_regs[0x10] = 0x00;
+            break;
+        case 0x11:
+            dev->pci_regs[0x11] = 0x00;
+            break;
+        case 0x12:
+            dev->pci_regs[0x12] = 0x00;
+            break;
+        case 0x13:  /* BAR0 byte 3 — top 8 bits of base address */
+            dev->pci_regs[0x13] = val;
             dev->mem_base_addr = (uint32_t)val << 24;
             fpga_recalc_mapping(dev);
             break;
 
+        case 0x30:  /* Expansion ROM BAR — not implemented, mask out */
+            dev->pci_regs[0x30] = 0x00;
+            break;
+        case 0x31:
+            dev->pci_regs[0x31] = 0x00;
+            break;
+        case 0x32:
+            dev->pci_regs[0x32] = 0x00;
+            break;
+        case 0x33:
+            dev->pci_regs[0x33] = 0x00;
+            break;
+
         default:
+            dev->pci_regs[addr & 0xFF] = val;
             break;
     }
 }
@@ -340,8 +404,12 @@ static void
 fpga_recalc_mapping(voodoo_fpga_bridge_t *dev)
 {
     if (dev->pci_enable && dev->mem_base_addr) {
+        fpga_bridge_log("[SST-1 Verilog] BAR0 mapping ENABLED at 0x%08X (16MB)\n",
+                        dev->mem_base_addr);
         mem_mapping_set_addr(&dev->mapping, dev->mem_base_addr, SST1_MEM_SIZE);
     } else {
+        fpga_bridge_log("[SST-1 Verilog] BAR0 mapping DISABLED (enable=%d base=0x%08X)\n",
+                        dev->pci_enable, dev->mem_base_addr);
         mem_mapping_disable(&dev->mapping);
     }
 }
@@ -355,11 +423,13 @@ fpga_snoop_fbiInit0(voodoo_fpga_bridge_t *dev, uint32_t val)
     uint32_t old = dev->fbiInit0;
     dev->fbiInit0 = val;
 
+    fpga_bridge_log("[SST-1 Verilog] fbiInit0 write: 0x%08X → 0x%08X\n", old, val);
+
     /* Detect VGA pass-through bit changes */
     if ((old ^ val) & FBIINIT0_VGA_PASS) {
         if (dev->svga) {
             svga_set_override(dev->svga, (val & FBIINIT0_VGA_PASS) ? 1 : 0);
-            fprintf(stderr, "[voodoo_fpga] VGA passthrough %s\n",
+            fpga_bridge_log("[SST-1 Verilog] VGA passthrough %s\n",
                     (val & FBIINIT0_VGA_PASS) ? "ACTIVE (Voodoo drives display)"
                                                : "INACTIVE (VGA drives display)");
         }
@@ -377,6 +447,9 @@ fpga_write_l(uint32_t addr, uint32_t val, void *priv)
 
     /* Compute offset within the 16 MB window */
     uint32_t offset = addr - dev->mem_base_addr;
+
+    fpga_bridge_log("[SST-1 Verilog] MMIO WRITE32  addr=0x%08X (off=0x%06X) val=0x%08X\n",
+                    addr, offset, val);
 
     /* Snoop fbiInit0 writes for VGA passthrough control */
     if (offset == SST_FBIINIT0)
@@ -450,6 +523,9 @@ fpga_read_l(uint32_t addr, void *priv)
     uint32_t rdata  = 0xFFFFFFFF;
 
     bridge_pci_request(dev, SST1_PCI_REQ_READ32, 0, offset, 0, &rdata);
+
+    fpga_bridge_log("[SST-1 Verilog] MMIO READ32   addr=0x%08X (off=0x%06X) → 0x%08X\n",
+                    addr, offset, rdata);
 
     return rdata;
 }
@@ -595,7 +671,41 @@ fpga_init(UNUSED(const device_t *info))
     dev->shm_fd  = -1;
     dev->channel = NULL;
 
-    fprintf(stderr, "[voodoo_fpga] Initializing SST-1 FPGA bridge device\n");
+    fpga_bridge_log("[SST-1 Verilog] Initializing SST-1 Verilog device\n");
+
+    /*
+     * Initialise shadow PCI config space with Voodoo 1 identity.
+     * This allows the guest OS to enumerate and configure the device
+     * even when the Verilator testbench is not connected.
+     */
+    memset(dev->pci_regs, 0, sizeof(dev->pci_regs));
+    /* Vendor ID: 3Dfx (0x121A) */
+    dev->pci_regs[0x00] = 0x1a;
+    dev->pci_regs[0x01] = 0x12;
+    /* Device ID: SST-1 (0x0001) */
+    dev->pci_regs[0x02] = 0x01;
+    dev->pci_regs[0x03] = 0x00;
+    /* Revision: 0x02 */
+    dev->pci_regs[0x08] = 0x02;
+    /* Class: 0x000000 (pre-VGA unclassified) */
+    dev->pci_regs[0x09] = 0x00;
+    dev->pci_regs[0x0a] = 0x00;
+    dev->pci_regs[0x0b] = 0x00;
+    /* Header type: 0x00 (normal) */
+    dev->pci_regs[0x0e] = 0x00;
+    /* BAR0: memory, 16MB aligned — low 24 bits hardwired to 0 */
+    dev->pci_regs[0x10] = 0x00;
+    dev->pci_regs[0x11] = 0x00;
+    dev->pci_regs[0x12] = 0x00;
+    dev->pci_regs[0x13] = 0x00;
+    /* Subsystem Vendor ID: 3Dfx */
+    dev->pci_regs[0x2c] = 0x1a;
+    dev->pci_regs[0x2d] = 0x12;
+    /* Subsystem ID */
+    dev->pci_regs[0x2e] = 0x01;
+    dev->pci_regs[0x2f] = 0x00;
+    /* Interrupt Pin: INTA# */
+    dev->pci_regs[0x3d] = 0x01;
 
     /* Build RGB565 -> ARGB32 colour lookup table */
     fpga_build_16to32(dev);
@@ -609,7 +719,7 @@ fpga_init(UNUSED(const device_t *info))
 
     /* Open shared memory channel to the Verilator process */
     if (bridge_shm_open(dev) < 0) {
-        fprintf(stderr, "[voodoo_fpga] WARNING: Could not open shared memory. "
+        fpga_bridge_log("[SST-1 Verilog] WARNING: Could not open shared memory. "
                 "Device will use fallback values.\n");
     }
 
@@ -631,17 +741,17 @@ fpga_init(UNUSED(const device_t *info))
     dev->svga = svga_get_pri();
     if (dev->svga) {
         dev->monitor_index = dev->svga->monitor_index;
-        fprintf(stderr, "[voodoo_fpga] VGA passthrough: SVGA found (monitor %d)\n",
+        fpga_bridge_log("[SST-1 Verilog] VGA passthrough: SVGA found (monitor %d)\n",
                 dev->monitor_index);
     } else {
         dev->monitor_index = 0;
-        fprintf(stderr, "[voodoo_fpga] WARNING: No primary SVGA found for VGA passthrough\n");
+        fpga_bridge_log("[SST-1 Verilog] WARNING: No primary SVGA found for VGA passthrough\n");
     }
 
     /* Initially VGA passthrough is OFF (fbiInit0 = 0) */
     dev->fbiInit0 = 0;
 
-    fprintf(stderr, "[voodoo_fpga] SST-1 FPGA bridge ready (PCI slot %d)\n",
+    fpga_bridge_log("[SST-1 Verilog] SST-1 SST-1 Verilog ready (PCI slot %d)\n",
             dev->pci_slot);
 
     return dev;
@@ -655,7 +765,7 @@ fpga_close(void *priv)
     if (!dev)
         return;
 
-    fprintf(stderr, "[voodoo_fpga] Closing SST-1 FPGA bridge\n");
+    fpga_bridge_log("[SST-1 Verilog] Closing SST-1 SST-1 Verilog\n");
 
     /* Release VGA passthrough if active */
     if ((dev->fbiInit0 & FBIINIT0_VGA_PASS) && dev->svga)
@@ -690,7 +800,7 @@ fpga_force_redraw(void *priv)
 /* ========================================================================= */
 
 const device_t voodoo_fpga_bridge_device = {
-    .name          = "3Dfx Voodoo Graphics (FPGA Bridge)",
+    .name          = "3Dfx Voodoo Graphics (SST-1 Verilog)",
     .internal_name = "voodoo_fpga_bridge",
     .flags         = DEVICE_PCI,
     .local         = 0,
