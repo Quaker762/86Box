@@ -326,9 +326,12 @@ fpga_pci_write(int func, int addr, UNUSED(int len), uint8_t val, void *priv)
 
     fpga_bridge_log("[SST-1 Verilog] PCI CFG WRITE addr=0x%02X val=0x%02X\n", addr, val);
 
-    /* Forward to RTL model */
+    /* Forward to RTL model.
+     * Send the full byte address (not DWORD-aligned) so the bridge server
+     * can recover the byte offset for correct byte-enable generation.
+     * The byte value is pre-shifted into its DWORD position.                */
     bridge_pci_request(dev, SST1_PCI_REQ_CONFIG_WRITE,
-                       (uint32_t)(addr & ~3), 0, (uint32_t)val << ((addr & 3) * 8),
+                       (uint32_t)addr, 0, (uint32_t)val << ((addr & 3) * 8),
                        NULL);
 
     /*
